@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.enoret.mousekit",
+  "name": "Mousekit",
+  "version": "1.0.0",
+  "author": "Enoret",
+  "license": "MIT",
+  "description": "DPI, polling rate, and button remapping for configurable mice, backed by libratbag.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Mouse",
+    "description": "Sensitivity presets, polling rate, and button remapping for the connected mouse.",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "alwaysShow": false,
+      "device": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 60
+      },
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Keep the icon visible when no mouse is configurable",
+        "defaultValue": false
+      },
+      {
+        "key": "device",
+        "type": "string",
+        "label": "Preferred device id (from `ratbagctl list`)",
+        "defaultValue": ""
+      }
+    ]
+  }
+}

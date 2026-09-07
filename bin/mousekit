@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# mousekit — thin ratbagctl wrapper for the Omarchy Mousekit bar widget.
+#
+# Everything the widget knows about a mouse comes out of one `probe` call, and
+# every change it makes goes through one `apply` call. Keeping the shell here
+# rather than in QML means the command strings are readable, quotable, and
+# testable from a terminal:
+#
+#   bin/mousekit probe
+#   bin/mousekit apply "" dpi 1600
+#   bin/mousekit apply "" button 3 special resolution-cycle-up
+#
+# Output is a flat KEY=VALUE / section protocol so the QML side parses it with
+# plain string splitting instead of shelling out once per field.
+
+set -uo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: mousekit probe [device-id]
+       mousekit apply <device-id> dpi <value>
+       mousekit apply <device-id> resolution <index>
+       mousekit apply <device-id> resolution-dpi <index> <value>
+       mousekit apply <device-id> rate <hz>
+       mousekit apply <device-id> button <index> button <n>
+       mousekit apply <device-id> button <index> special <name>
+       mousekit apply <device-id> button <index> macro <key> [key...]
+
+An empty device-id means "the first device ratbagctl reports".
+EOF
+}
+
+have_cli() { command -v ratbagctl >/dev/null 2>&1; }
+
+trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# One line per device: "<id>\t<name>". `ratbagctl list` pads its columns as
+# "<id>:<spaces><name>", so the first colon is the only reliable separator.
+list_devices() {
+  local line id name
+  while IFS= read -r line; do
+    case "$line" in
+      *:*) ;;
+      *) continue ;;
+    esac
+    id=$(trim "${line%%:*}")
+    name=$(trim "${line#*:}")
+    [ -n "$id" ] || continue
+    printf '%s\t%s\n' "$id" "$name"
+  done
+}
+
+# Prefer the requested device, fall back to the first one still present, so a
+# stored preference for an unplugged mouse degrades instead of erroring.
+pick_device() {
+  local want=$1 devices=$2 id first=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    id=${line%%$'\t'*}
+    [ -n "$first" ] || first=$id
+    if [ -n "$want" ] && [ "$id" = "$want" ]; then
+      printf '%s\n' "$id"
+      return 0
+    fi
+  done <<EOF
+$devices
+EOF
+  printf '%s\n' "$first"
+}
+
+probe() {
+  local want=${1:-}
+
+  if ! have_cli; then
+    printf 'STATUS=nocli\n'
+    return 0
+  fi
+
+  local raw rc
+  raw=$(ratbagctl list 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    printf 'STATUS=nodaemon\nERR=%s\n' "$(printf '%s' "$raw" | tr '\n' ' ' | cut -c1-240)"
+    return 0
+  fi
+
+  local devices
+  devices=$(printf '%s\n' "$raw" | list_devices)
+  if [ -z "$devices" ]; then
+    printf 'STATUS=nodevice\n'
+    return 0
+  fi
+
+  local device
+  device=$(pick_device "$want" "$devices")
+
+  local info
+  info=$(ratbagctl "$device" info 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    printf 'STATUS=error\nERR=%s\n' "$(printf '%s' "$info" | tr '\n' ' ' | cut -c1-240)"
+    return 0
+  fi
+
+  printf 'STATUS=ok\n'
+  printf 'DEVICE=%s\n' "$device"
+  while IFS= read -r line; do
+    [ -n "$line" ] && printf 'DEVICES=%s\n' "$line"
+  done <<EOF
+$devices
+EOF
+
+  printf -- '--INFO--\n%s\n' "$info"
+  probe_live "$device" "$info"
+  printf -- '--DPIS--\n%s\n' "$(ratbagctl "$device" dpi get-all 2>/dev/null)"
+  printf -- '--RATES--\n%s\n' "$(ratbagctl "$device" rate get-all 2>/dev/null)"
+  printf -- '--END--\n'
+}
+
+# Does `info` actually describe the profile the mouse is using?
+#
+# ratbagctl prints nothing but a header for a profile it considers disabled,
+# and some devices report their ACTIVE profile as disabled — a Logitech PRO X
+# reports 5 profiles with profile 1 "(disabled) (active)". `info` then
+# describes profile 0 while every bare write lands on profile 1, and the two
+# hold genuinely different values. Rendering info's profile there would show
+# 800 DPI while the mouse ran at 1600.
+info_shows_active() {
+  local info=$1 index=$2
+  # No active index to compare against: trust info rather than pay for the
+  # slow path on every poll.
+  [ -n "$index" ] || return 0
+  printf '%s\n' "$info" | grep -qE "^[[:space:]]*Profile ${index}:" || return 1
+  printf '%s\n' "$info" | grep -qE "^[[:space:]]*Profile ${index}:.*\(disabled\)" && return 1
+  return 0
+}
+
+# Read the active profile one item at a time. Per-item getters ignore the
+# disabled flag, so this works where `info` goes quiet — at roughly 15x the
+# cost, which is why it only runs when info_shows_active says it must.
+probe_live() {
+  local device=$1 info=$2
+  local active
+  active=$(ratbagctl "$device" profile active get 2>/dev/null | tr -dc '0-9')
+
+  info_shows_active "$info" "$active" && return 0
+
+  printf -- '--LIVE--\n'
+  printf 'PROFILE=%s\n' "$active"
+  printf 'RATE=%s\n' "$(ratbagctl "$device" rate get 2>/dev/null | tr -dc '0-9')"
+
+  local count
+  count=$(ratbagctl "$device" button count 2>/dev/null | tr -dc '0-9')
+  [ -n "$count" ] || count=0
+  printf 'BUTTONCOUNT=%s\n' "$count"
+
+  # How many resolution slots to ask for: whatever the profile info did render
+  # is the right shape, and 8 is a safe ceiling when it rendered none. The
+  # loop stops early on the first invalid index either way.
+  local slots out i=0
+  slots=$(printf '%s\n' "$info" | grep -cE '^[[:space:]]+[0-9]+:[[:space:]]*([0-9]+(x[0-9]+)?dpi|<disabled>)')
+  [ "$slots" -gt 0 ] 2>/dev/null || slots=8
+  while [ "$i" -lt "$slots" ]; do
+    out=$(ratbagctl "$device" resolution "$i" get 2>&1)
+    case "$out" in *"Invalid resolution"*) break ;; esac
+    printf '%s\n' "$out"
+    i=$((i + 1))
+  done
+
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    out=$(ratbagctl "$device" button "$i" action get 2>&1)
+    case "$out" in *"Invalid button"*) break ;; esac
+    printf '%s\n' "$out"
+    i=$((i + 1))
+  done
+}
+
+apply() {
+  have_cli || { printf 'ERR=ratbagctl is not installed\n'; return 1; }
+
+  local want=${1:-}
+  shift || true
+
+  local devices device
+  devices=$(ratbagctl list 2>/dev/null | list_devices)
+  [ -n "$devices" ] || { printf 'ERR=No configurable mouse found\n'; return 1; }
+  device=$(pick_device "$want" "$devices")
+
+  local action=${1:-}
+  shift || true
+
+  local out rc
+  case "$action" in
+    dpi)            out=$(ratbagctl "$device" dpi set "${1:?dpi value}" 2>&1) ;;
+    resolution)     out=$(ratbagctl "$device" resolution active set "${1:?index}" 2>&1) ;;
+    resolution-dpi) out=$(ratbagctl "$device" resolution "${1:?index}" dpi set "${2:?value}" 2>&1) ;;
+    rate)           out=$(ratbagctl "$device" rate set "${1:?hz}" 2>&1) ;;
+    button)
+      local index=${1:?button index} kind=${2:?action kind}
+      shift 2
+      case "$kind" in
+        button)  out=$(ratbagctl "$device" button "$index" action set button "${1:?button number}" 2>&1) ;;
+        special) out=$(ratbagctl "$device" button "$index" action set special "${1:?special name}" 2>&1) ;;
+        macro)   out=$(ratbagctl "$device" button "$index" action set macro "$@" 2>&1) ;;
+        *) printf 'ERR=Unknown button action %s\n' "$kind"; return 1 ;;
+      esac
+      ;;
+    *) printf 'ERR=Unknown action %s\n' "$action"; return 1 ;;
+  esac
+  rc=$?
+
+  if [ $rc -ne 0 ]; then
+    printf 'ERR=%s\n' "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240)"
+    return 1
+  fi
+  printf 'OK=%s\n' "$device"
+}
+
+case "${1:-probe}" in
+  probe) shift || true; probe "$@" ;;
+  apply) shift || true; apply "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
